@@ -20,7 +20,7 @@ from scipy.interpolate import RectBivariateSpline
 from . import utils
 from .sparsedetect import (neuropil_subtraction, square_convolution_2d, downsample,
                            threshold_reduce, find_best_scale, add_square, iter_extend,
-                           two_comps, multiscale_mask)
+                           two_comps, multiscale_mask, extendROI)
 
 logger = logging.getLogger(__name__)
 
@@ -231,3 +231,158 @@ def sparsery_with_state(mov, sdmov, highpass_neuropil, spatial_scale, threshold_
         "threshold_stop": vmultiplier * Th2, "sdmov": sdmov, "lxs": lxs,
     }
     return new_settings, stats, state
+
+
+def make_seed(ypix, xpix, lam, n_pixels, Lyc, Lxc):
+    """
+    Seed of ``n_pixels`` pixels from a footprint: its brightest pixels, equal weights,
+    unit norm, like sparsery's square seeds (3x3, 6x6, 12x12 = 9, 36, 144 pixels).
+
+    If the footprint has fewer pixels, it is padded with rings of neighbors
+    (closest to the footprint's weighted center first).
+
+    Parameters
+    ----------
+    ypix, xpix : numpy.ndarray
+        Footprint pixels in binned-movie coordinates (int).
+    lam : numpy.ndarray
+        Footprint weights (only their order matters).
+    n_pixels : int
+        Seed size.
+    Lyc, Lxc : int
+        Binned-movie frame size.
+
+    Returns
+    -------
+    ypix_seed, xpix_seed : numpy.ndarray
+    w_seed : numpy.ndarray
+        Equal weights with unit norm.
+    """
+    order = np.argsort(-lam, kind="stable")
+    ys, xs = ypix[order], xpix[order]
+    if ys.size < n_pixels:
+        yc, xc = np.average(ypix, weights=lam), np.average(xpix, weights=lam)
+        ys_ring, xs_ring = ys, xs
+        while ys.size < n_pixels:
+            ys_ring, xs_ring = extendROI(ys_ring, xs_ring, Lyc, Lxc, 1)
+            is_new = ~np.isin(ys_ring * Lxc + xs_ring, ys * Lxc + xs)
+            yn, xn = ys_ring[is_new], xs_ring[is_new]
+            if yn.size == 0:
+                raise ValueError("Footprint cannot be padded to the seed size inside the frame")
+            order_new = np.argsort((yn - yc)**2 + (xn - xc)**2, kind="stable")
+            ys = np.concatenate([ys, yn[order_new]])
+            xs = np.concatenate([xs, xn[order_new]])
+    ys, xs = ys[:n_pixels], xs[:n_pixels]
+    return ys, xs, np.full(n_pixels, 1.0 / np.sqrt(n_pixels), dtype=np.float32)
+
+
+def score_trace(tproj, threshold):
+    """Sparsery's peak score: sqrt of the summed squares of the bins above threshold."""
+    return float(np.sqrt(np.sum(tproj[tproj > threshold]**2)))
+
+
+def _iter_extend_bounded(ypix, xpix, mov, Lyc, Lxc, active_frames, allowed):
+    """iter_extend (sparsedetect) with growth limited to pixels where ``allowed`` is True."""
+    npix = 0
+    iter = 0
+    while npix < 10000:
+        npix = ypix.size
+        ypix, xpix = extendROI(ypix, xpix, Lyc, Lxc, 1)
+        keep = allowed[ypix, xpix]
+        ypix, xpix = ypix[keep], xpix[keep]
+        usub = mov[np.ix_(active_frames, ypix * Lxc + xpix)]
+        lam = usub.mean(axis=0)
+        ix = lam > max(0, lam.max() / 5.0)
+        if ix.sum() == 0:
+            break
+        ypix, xpix, lam = ypix[ix], xpix[ix], lam[ix]
+        if iter == 0:
+            sgn = 1.
+        if np.sign(sgn * (ix.sum() - npix)) <= 0:
+            break
+        else:
+            npix = ypix.size
+        iter += 1
+    lam = lam / np.sum(lam**2)**.5
+    return ypix, xpix, lam
+
+
+def grow_from_footprint(state, ypix, xpix, lam, seed_sizes=(9, 36, 144), radius_allowed=3,
+                        subtract=False):
+    """
+    Seed sparsery's ROI growth from a given footprint on the residual movie.
+
+    Steps, following sparsery's loop: seeds of each size from the footprint's
+    brightest pixels -> keep the best-scoring seed -> active bins (projection >
+    Th2) -> 3 rounds of mask growth, limited to ``radius_allowed`` pixels around
+    the footprint -> split check -> final mask, trace and scores.
+
+    Parameters
+    ----------
+    state : dict
+        From ``sparsery_with_state``. ``state["mov"]`` is updated if ``subtract``.
+    ypix, xpix, lam : numpy.ndarray
+        Footprint in binned-movie coordinates (not session coordinates:
+        subtract yrange[0], xrange[0]).
+    seed_sizes : tuple of int
+        Seed sizes in pixels.
+    radius_allowed : int
+        How far (in pixels, 4-connected steps) the mask may grow beyond the footprint.
+    subtract : bool
+        Subtract the ROI's activity from the residual, as sparsery does for an
+        accepted ROI.
+
+    Returns
+    -------
+    out : dict
+        "score_seeds": score of each seed size; "n_pixels_seed": best seed size;
+        "score_seed": its score (compare with state["threshold_stop"]);
+        "n_active": active bins; "ypix", "xpix", "lam": final mask (lam in
+        normalized units, unit norm; empty if no active bins); "trace": projection
+        of the residual onto the final mask (nbinned,); "score_final": score of that
+        trace; "vsplit": split ratio (sparsery splits above 1.25).
+    """
+    mov, Lyc, Lxc, Th2 = state["mov"], state["Lyc"], state["Lxc"], state["Th2"]
+
+    ## Best seed size
+    scores, seeds = [], []
+    for n_pixels in seed_sizes:
+        ys, xs, w = make_seed(ypix, xpix, lam, n_pixels, Lyc, Lxc)
+        scores.append(score_trace(mov[:, ys * Lxc + xs] @ w, Th2))
+        seeds.append((ys, xs, w))
+    i_best = int(np.argmax(scores))
+    ypix0, xpix0, lam0 = seeds[i_best]
+    out = {"score_seeds": scores, "n_pixels_seed": int(seed_sizes[i_best]), "score_seed": scores[i_best]}
+
+    ## Allowed growth region: footprint dilated by radius_allowed
+    allowed = np.zeros((Lyc, Lxc), dtype=bool)
+    ya, xa = extendROI(ypix, xpix, Lyc, Lxc, radius_allowed)
+    allowed[ya, xa] = True
+    allowed[ypix0, xpix0] = True
+
+    tproj = mov[:, ypix0 * Lxc + xpix0] @ lam0
+    active_frames = np.nonzero(tproj > Th2)[0]
+    for j in range(3):
+        if len(active_frames) < 1:
+            break
+        ypix0, xpix0, lam0 = _iter_extend_bounded(ypix0, xpix0, mov, Lyc, Lxc, active_frames, allowed)
+        tproj = mov[:, ypix0 * Lxc + xpix0] @ lam0
+        active_frames = np.nonzero(tproj > Th2)[0]
+    if len(active_frames) < 1:
+        out.update({"n_active": 0, "ypix": np.zeros(0, int), "xpix": np.zeros(0, int), "lam": np.zeros(0),
+                    "trace": tproj, "score_final": 0.0, "vsplit": 0.0})
+        return out
+
+    vsplit, ipack = two_comps(mov[:, ypix0 * Lxc + xpix0], lam0, Th2)
+    if vsplit > 1.25:
+        lam0, xp, active_frames = ipack
+        tproj[active_frames] = xp
+        ix = lam0 > lam0.max() / 5
+        ypix0, xpix0, lam0 = ypix0[ix], xpix0[ix], lam0[ix]
+        active_frames = np.nonzero(active_frames)[0] if active_frames.dtype == bool else active_frames
+
+    out.update({"n_active": int(len(active_frames)), "ypix": ypix0.astype(int), "xpix": xpix0.astype(int),
+                "lam": lam0, "trace": tproj, "score_final": score_trace(tproj, Th2), "vsplit": float(vsplit)})
+    if subtract:
+        mov[np.ix_(active_frames, ypix0 * Lxc + xpix0)] -= tproj[active_frames][:, np.newaxis] * lam0
+    return out
