@@ -162,7 +162,7 @@ def pipeline(save_path, f_reg, f_raw=None, f_reg_chan2=None, f_raw_chan2=None,
                                                 classifier_path=classfile,
                                                 badframes=bad_frames,
                                                 preclassify=settings["classification"]["preclassify"],
-                                                device=device)
+                                                device=device, save_path=save_path)
         np.save(os.path.join(save_path, "stat.npy"), stat)
         np.save(os.path.join(save_path, "detect_outputs.npy"), detect_outputs)
         if redcell is not None:

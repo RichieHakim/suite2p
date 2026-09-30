@@ -594,6 +594,22 @@ SETTINGS = {
             "default": True,
             "description": "Crop dendrites from ROI to determine ROI npix_norm and compactness.",
         },
+        "save_binned_movie": {
+            "gui_name": "Save binned movie",
+            "type": bool,
+            "min": None,
+            "max": None,
+            "default": False,
+            "description": "Save the binned movie used for detection (before temporal high-pass filtering) to mov_binned.npy, and its bin size and crop to mov_binned_info.npy, so detection can be rerun exactly.",
+        },
+        "save_prefilter_rois": {
+            "gui_name": "Save pre-filter ROIs",
+            "type": bool,
+            "min": None,
+            "max": None,
+            "default": False,
+            "description": "Save all detected ROIs before the preclassify, npix_norm and max_overlap filters to stat_prefilter.npy. Every ROI (before and after filtering) gets 'idetect', its index in that list (for sparsery, also its index into Vmax, ihop and Vsplit).",
+        },
         "chan2_threshold": {
             "gui_name": "Chan2 threshold",
             "type": float,

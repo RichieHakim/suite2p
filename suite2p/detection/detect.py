@@ -1,6 +1,7 @@
 """
 Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
 """
+import os
 import time
 import numpy as np
 from pathlib import Path
@@ -105,7 +106,7 @@ def detection_wrapper(f_reg, diameter=[12., 12.], tau=1., fs=30, meanImg_chan2=N
                       yrange=None, xrange=None, badframes=None, mov=None, 
                       preclassify=0., classifier_path=None, 
                       settings=default_settings()["detection"],
-                      device=torch.device("cuda")):
+                      device=torch.device("cuda"), save_path=None):
     """
     Run the full ROI detection pipeline on a registered movie.
 
@@ -146,6 +147,9 @@ def detection_wrapper(f_reg, diameter=[12., 12.], tau=1., fs=30, meanImg_chan2=N
         Detection settings dictionary.
     device : torch.device, optional (default torch.device("cuda"))
         Torch device for cellpose-based detection.
+    save_path : str, optional
+        Folder for the optional detection outputs (settings "save_binned_movie"
+        and "save_prefilter_rois"). Required if either is on.
 
     Returns
     -------
@@ -163,7 +167,12 @@ def detection_wrapper(f_reg, diameter=[12., 12.], tau=1., fs=30, meanImg_chan2=N
     n_frames, Ly, Lx = f_reg.shape
     yrange = [0, Ly] if yrange is None else yrange
     xrange = [0, Lx] if xrange is None else xrange
+    save_binned_movie = settings.get("save_binned_movie", False)
+    save_prefilter_rois = settings.get("save_prefilter_rois", False)
+    if (save_binned_movie or save_prefilter_rois) and save_path is None:
+        raise ValueError("save_path is required when save_binned_movie or save_prefilter_rois is on")
     
+    bin_size = None
     if mov is None:
         nbins = settings["nbins"]
         bin_size = settings.get("bin_size") or int(max(1, n_frames // nbins, np.round(tau * fs)))
@@ -175,6 +184,14 @@ def detection_wrapper(f_reg, diameter=[12., 12.], tau=1., fs=30, meanImg_chan2=N
             raise ValueError("mov.shape[1] is not same size as yrange")
         elif mov.shape[2] != xrange[-1] - xrange[0]:
             raise ValueError("mov.shape[2] is not same size as xrange")
+
+    if save_binned_movie:
+        np.save(os.path.join(save_path, "mov_binned.npy"), mov)
+        np.save(os.path.join(save_path, "mov_binned_info.npy"),
+                {"bin_size": bin_size, "yrange": yrange, "xrange": xrange,
+                 "n_frames": n_frames, "Ly": Ly, "Lx": Lx,
+                 "n_badframes": 0 if badframes is None else int(badframes.sum())})
+        logger.info(f"Saved binned movie {mov.shape} to {save_path}")
 
     if settings.get("inverted_activity", False):
         mov -= mov.min()
@@ -229,6 +246,12 @@ def detection_wrapper(f_reg, diameter=[12., 12.], tau=1., fs=30, meanImg_chan2=N
         s["ypix"] += ymin; s["xpix"] += xmin; 
         if "med" in s:
             s["med"][0] += ymin; s["med"][1] += xmin
+
+    if save_prefilter_rois:
+        for i, s in enumerate(stat):
+            s["idetect"] = i
+        np.save(os.path.join(save_path, "stat_prefilter.npy"), stat)
+        logger.info(f"Saved {len(stat)} pre-filter ROIs to {save_path}")
 
     if preclassify > 0.:
         if classifier_path is None:
