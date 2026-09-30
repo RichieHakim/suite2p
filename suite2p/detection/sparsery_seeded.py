@@ -4,8 +4,9 @@ Sparsery with access to its internal state, for seeding ROIs at given locations.
 ``sparsery_with_state`` runs the same greedy loop as ``sparsedetect.sparsery`` and
 returns, besides the usual outputs, the state at the stop: the residual movie
 (ROI activity subtracted) and the multiscale maps. Seeded searches can then
-continue from where sparsery stopped. It can also forbid peaks in given pixels
-(``blocked``), which leaves those cells' activity in the residual.
+continue from where sparsery stopped. It can also forbid peaks whose seed square
+would touch given pixels (``blocked``), so no ROI starts on those cells; other
+ROIs may still grow over them.
 
 With ``blocked=None`` the outputs equal ``sparsedetect.sparsery``; the loop body is
 copied from it (suite2p 90be895) and must stay in step with it.
@@ -49,13 +50,21 @@ def preprocess_binned_movie(mov_binned, highpass_time):
     return mov, sdmov
 
 
-def _blocked_per_scale(blocked, gxy):
-    """Map a pixel mask (Lyc, Lxc) onto each scale's grid via the grid's pixel coordinates."""
+def _blocked_per_scale(blocked, gxy, lxs):
+    """
+    Per scale: grid points whose seed square (``add_square`` of size lxs[j] at the
+    grid point's pixel position, as the sparsery loop builds it) contains a blocked pixel.
+    """
+    Ly, Lx = blocked.shape
+    csum = np.zeros((Ly + 1, Lx + 1), dtype=np.int64)  ## integral image
+    csum[1:, 1:] = blocked.cumsum(axis=0).cumsum(axis=1)
     out = []
-    for g in gxy[:-1]:
-        yy = np.clip(g[1].astype(int), 0, blocked.shape[0] - 1)
-        xx = np.clip(g[0].astype(int), 0, blocked.shape[1] - 1)
-        out.append(blocked[yy, xx])
+    for g, ls in zip(gxy[:-1], lxs):
+        lhf = int((ls - 1) / 2)
+        y, x = g[1].astype(int), g[0].astype(int)  ## (Lyp, Lxp) pixel position of each grid point
+        y0, y1 = np.clip(y - lhf, 0, Ly), np.clip(y - lhf + ls, 0, Ly)
+        x0, x1 = np.clip(x - lhf, 0, Lx), np.clip(x - lhf + ls, 0, Lx)
+        out.append((csum[y1, x1] - csum[y0, x1] - csum[y1, x0] + csum[y0, x0]) > 0)
     return out
 
 
@@ -69,8 +78,9 @@ def sparsery_with_state(mov, sdmov, highpass_neuropil, spatial_scale, threshold_
     mov, sdmov, highpass_neuropil, spatial_scale, threshold_scaling, max_ROIs, active_percentile
         As in ``sparsedetect.sparsery``. ``mov`` is overwritten (as there).
     blocked : numpy.ndarray, optional
-        Boolean (Lyc, Lxc). Peaks whose position falls on a True pixel are never
-        taken, at any scale, so the activity there stays in the residual.
+        Boolean (Lyc, Lxc). A peak is never taken if its seed square (at that
+        peak's scale) contains a True pixel, so no ROI starts on those cells.
+        ROIs started elsewhere may still grow over them.
 
     Returns
     -------
@@ -136,7 +146,7 @@ def sparsery_with_state(mov, sdmov, highpass_neuropil, spatial_scale, threshold_
     v_split = np.zeros(max_ROIs)
     V1 = deepcopy(v_map)
     stats = []
-    allowed = None if blocked is None else [~b for b in _blocked_per_scale(blocked, gxy)]
+    allowed = None if blocked is None else [~b for b in _blocked_per_scale(blocked, gxy, lxs)]
 
     t0 = time.time()
     for tj in range(max_ROIs):
@@ -315,7 +325,8 @@ def grow_from_footprint(state, ypix, xpix, lam, seed_sizes=(9, 36, 144), radius_
     Steps, following sparsery's loop: seeds of each size from the footprint's
     brightest pixels -> keep the best-scoring seed -> active bins (projection >
     Th2) -> 3 rounds of mask growth, limited to ``radius_allowed`` pixels around
-    the footprint -> split check -> final mask, trace and scores.
+    the footprint (or unlimited, as in sparsery) -> split check -> final mask,
+    trace and scores.
 
     Parameters
     ----------
@@ -326,8 +337,9 @@ def grow_from_footprint(state, ypix, xpix, lam, seed_sizes=(9, 36, 144), radius_
         subtract yrange[0], xrange[0]).
     seed_sizes : tuple of int
         Seed sizes in pixels.
-    radius_allowed : int
+    radius_allowed : int or None
         How far (in pixels, 4-connected steps) the mask may grow beyond the footprint.
+        ``None``: no limit (sparsery's own ``iter_extend``).
     subtract : bool
         Subtract the ROI's activity from the residual, as sparsery does for an
         accepted ROI.
@@ -355,17 +367,21 @@ def grow_from_footprint(state, ypix, xpix, lam, seed_sizes=(9, 36, 144), radius_
     out = {"score_seeds": scores, "n_pixels_seed": int(seed_sizes[i_best]), "score_seed": scores[i_best]}
 
     ## Allowed growth region: footprint dilated by radius_allowed
-    allowed = np.zeros((Lyc, Lxc), dtype=bool)
-    ya, xa = extendROI(ypix, xpix, Lyc, Lxc, radius_allowed)
-    allowed[ya, xa] = True
-    allowed[ypix0, xpix0] = True
+    if radius_allowed is not None:
+        allowed = np.zeros((Lyc, Lxc), dtype=bool)
+        ya, xa = extendROI(ypix, xpix, Lyc, Lxc, radius_allowed)
+        allowed[ya, xa] = True
+        allowed[ypix0, xpix0] = True
 
     tproj = mov[:, ypix0 * Lxc + xpix0] @ lam0
     active_frames = np.nonzero(tproj > Th2)[0]
     for j in range(3):
         if len(active_frames) < 1:
             break
-        ypix0, xpix0, lam0 = _iter_extend_bounded(ypix0, xpix0, mov, Lyc, Lxc, active_frames, allowed)
+        if radius_allowed is None:
+            ypix0, xpix0, lam0 = iter_extend(ypix0, xpix0, mov, Lyc, Lxc, active_frames)
+        else:
+            ypix0, xpix0, lam0 = _iter_extend_bounded(ypix0, xpix0, mov, Lyc, Lxc, active_frames, allowed)
         tproj = mov[:, ypix0 * Lxc + xpix0] @ lam0
         active_frames = np.nonzero(tproj > Th2)[0]
     if len(active_frames) < 1:
